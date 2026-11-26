@@ -113,6 +113,26 @@ func (pool *BlockPool) OnStart() error {
 	return nil
 }
 
+// OnStop releases owned state. Stop signals requesters but does not join their
+// goroutines: they may still need pool.mtx, and pool.Quit closes after OnStop.
+func (pool *BlockPool) OnStop() {
+	pool.mtx.Lock()
+	defer pool.mtx.Unlock()
+
+	for height, request := range pool.requesters {
+		if err := request.Stop(); err != nil && !errors.Is(err, service.ErrAlreadyStopped) {
+			pool.Logger.Error("Error stopping requester", "err", err)
+		}
+		delete(pool.requesters, height)
+	}
+	for _, peer := range pool.peers {
+		if peer.timeout != nil {
+			peer.timeout.Stop()
+		}
+		peer.numPending = 0
+	}
+}
+
 func (pool *BlockPool) makeRequestersRoutine() {
 	for {
 		if !pool.IsRunning() {
@@ -151,8 +171,18 @@ func (pool *BlockPool) makeRequestersRoutine() {
 }
 
 func (pool *BlockPool) removeTimedoutPeers() {
+	var peerErrors []peerError
 	pool.mtx.Lock()
-	defer pool.mtx.Unlock()
+	defer func() {
+		pool.mtx.Unlock()
+		// Preserve backpressure without preventing OnStop from taking the lock.
+		for _, err := range peerErrors {
+			pool.sendError(err.err, err.peerID)
+		}
+	}()
+	if !pool.IsRunning() {
+		return
+	}
 
 	for _, peer := range pool.peers {
 		if !peer.didTimeout && peer.numPending > 0 {
@@ -160,7 +190,7 @@ func (pool *BlockPool) removeTimedoutPeers() {
 			// curRate can be 0 on start
 			if curRate != 0 && curRate < minRecvRate {
 				err := errors.New("peer is not sending us data fast enough")
-				pool.sendError(err, peer.id)
+				peerErrors = append(peerErrors, peerError{err, peer.id})
 				pool.Logger.Error("SendTimeout", "peer", peer.id,
 					"reason", err,
 					"curRate", fmt.Sprintf("%d KB/s", curRate/1024),
@@ -236,6 +266,9 @@ func (pool *BlockPool) PopRequest() {
 
 	r := pool.requesters[pool.height]
 	if r == nil {
+		if !pool.IsRunning() {
+			return
+		}
 		panic(fmt.Sprintf("Expected requester to pop, got nothing at height %v", pool.height))
 	}
 
@@ -263,6 +296,9 @@ func (pool *BlockPool) RemovePeerAndRedoAllPeerRequests(height int64) p2p.ID {
 	defer pool.mtx.Unlock()
 
 	request := pool.requesters[height]
+	if request == nil || !pool.IsRunning() {
+		return ""
+	}
 	peerID := request.gotBlockFromPeerID()
 	// RemovePeer will redo all requesters associated with this peer.
 	pool.removePeer(peerID)
@@ -275,6 +311,9 @@ func (pool *BlockPool) RemovePeerAndRedoAllPeerRequests(height int64) p2p.ID {
 func (pool *BlockPool) RedoRequestFrom(height int64, peerID p2p.ID) {
 	pool.mtx.Lock()
 	defer pool.mtx.Unlock()
+	if !pool.IsRunning() {
+		return
+	}
 
 	if requester, ok := pool.requesters[height]; ok { // If we requested this block
 		if requester.didRequestFrom(peerID) { // From this specific peer
@@ -297,15 +336,23 @@ func (pool *BlockPool) RedoRequest(height int64) p2p.ID {
 // height of the extended commit and the height of the block do not match, we
 // do not add the block and return an error.
 func (pool *BlockPool) AddBlock(peerID p2p.ID, block *types.Block, extCommit *types.ExtendedCommit, blockSize int) error {
+	var peerErr error
+	pool.mtx.Lock()
+	defer func() {
+		pool.mtx.Unlock()
+		if peerErr != nil {
+			pool.sendError(peerErr, peerID)
+		}
+	}()
+	if !pool.IsRunning() {
+		return service.ErrAlreadyStopped
+	}
 	if extCommit != nil && block.Height != extCommit.Height {
 		err := fmt.Errorf("block height %d != extCommit height %d", block.Height, extCommit.Height)
 		// Peer sent us an invalid block => remove it.
-		pool.sendError(err, peerID)
+		peerErr = err
 		return err
 	}
-
-	pool.mtx.Lock()
-	defer pool.mtx.Unlock()
 
 	requester := pool.requesters[block.Height]
 	if requester == nil {
@@ -316,7 +363,7 @@ func (pool *BlockPool) AddBlock(peerID p2p.ID, block *types.Block, extCommit *ty
 		if block.Height > pool.height || block.Height < pool.startHeight {
 			err := fmt.Errorf("peer sent us block #%d we didn't expect (current height: %d, start height: %d)",
 				block.Height, pool.height, pool.startHeight)
-			pool.sendError(err, peerID)
+			peerErr = err
 			return err
 		}
 
@@ -325,7 +372,7 @@ func (pool *BlockPool) AddBlock(peerID p2p.ID, block *types.Block, extCommit *ty
 
 	if !requester.setBlock(block, extCommit, peerID) {
 		err := fmt.Errorf("requested block #%d from %v, not %s", block.Height, requester.requestedFrom(), peerID)
-		pool.sendError(err, peerID)
+		peerErr = err
 		return err
 	}
 
@@ -465,6 +512,9 @@ func (pool *BlockPool) banPeer(peerID p2p.ID) {
 func (pool *BlockPool) pickIncrAvailablePeer(height int64, excludePeerID p2p.ID) *bpPeer {
 	pool.mtx.Lock()
 	defer pool.mtx.Unlock()
+	if !pool.IsRunning() {
+		return nil
+	}
 
 	for _, peer := range pool.sortedPeers {
 		if peer.id == excludePeerID {
@@ -498,10 +548,14 @@ func (pool *BlockPool) sortPeers() {
 
 func (pool *BlockPool) makeNextRequester(nextHeight int64) {
 	pool.mtx.Lock()
+	defer pool.mtx.Unlock()
+	if !pool.IsRunning() {
+		return
+	}
 	request := newBPRequester(pool, nextHeight)
 	pool.requesters[nextHeight] = request
-	pool.mtx.Unlock()
-
+	// OnStart only spawns a goroutine. Keep Start serialized with OnStop so
+	// cleanup never encounters a published requester that has not started yet.
 	if err := request.Start(); err != nil {
 		request.Logger.Error("Error starting request", "err", err)
 	}
@@ -512,15 +566,22 @@ func (pool *BlockPool) sendRequest(height int64, peerID p2p.ID) {
 	if !pool.IsRunning() {
 		return
 	}
-	pool.requestsCh <- BlockRequest{height, peerID}
+	select {
+	case pool.requestsCh <- BlockRequest{height, peerID}:
+	case <-pool.Quit():
+	}
 }
 
-// thread-safe.
+// Thread-safe. Callers must not hold pool.mtx: Quit closes after OnStop,
+// which needs that lock. Live errors retain backpressure; shutdown cancels it.
 func (pool *BlockPool) sendError(err error, peerID p2p.ID) {
 	if !pool.IsRunning() {
 		return
 	}
-	pool.errorsCh <- peerError{err, peerID}
+	select {
+	case pool.errorsCh <- peerError{err, peerID}:
+	case <-pool.Quit():
+	}
 }
 
 // for debugging purposes
@@ -611,12 +672,16 @@ func (peer *bpPeer) decrPending(recvSize int) {
 
 func (peer *bpPeer) onTimeout() {
 	peer.pool.mtx.Lock()
-	defer peer.pool.mtx.Unlock()
+	if !peer.pool.IsRunning() {
+		peer.pool.mtx.Unlock()
+		return
+	}
+	peer.didTimeout = true
+	peer.pool.mtx.Unlock()
 
 	err := errors.New("peer did not send us anything")
 	peer.pool.sendError(err, peer.id)
 	peer.logger.Error("SendTimeout", "reason", err, "timeout", peerTimeout)
-	peer.didTimeout = true
 }
 
 // -------------------------------------
@@ -667,9 +732,29 @@ func (bpr *bpRequester) OnStart() error {
 	return nil
 }
 
+// OnStop clears retained responses under the same lock as setBlock. It does
+// not wait for requestRoutine, which can still be waiting for the pool lock.
+func (bpr *bpRequester) OnStop() {
+	bpr.mtx.Lock()
+	defer bpr.mtx.Unlock()
+	bpr.block = nil
+	bpr.extCommit = nil
+	bpr.gotBlockFrom = ""
+	bpr.peerID = ""
+	bpr.secondPeerID = ""
+	select {
+	case <-bpr.redoCh:
+	default:
+	}
+}
+
 // Returns true if the peer(s) match and block doesn't already exist.
 func (bpr *bpRequester) setBlock(block *types.Block, extCommit *types.ExtendedCommit, peerID p2p.ID) bool {
 	bpr.mtx.Lock()
+	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+		bpr.mtx.Unlock()
+		return false
+	}
 	if bpr.peerID != peerID && bpr.secondPeerID != peerID {
 		bpr.mtx.Unlock()
 		return false
@@ -757,6 +842,11 @@ func (bpr *bpRequester) reset(peerID p2p.ID) (removedBlock bool) {
 // NOTE: Nonblocking, and does nothing if another redo
 // was already requested.
 func (bpr *bpRequester) redo(peerID p2p.ID) {
+	bpr.mtx.Lock()
+	defer bpr.mtx.Unlock()
+	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+		return
+	}
 	select {
 	case bpr.redoCh <- peerID:
 	default:
@@ -783,6 +873,10 @@ PICK_PEER_LOOP:
 		break PICK_PEER_LOOP
 	}
 	bpr.mtx.Lock()
+	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+		bpr.mtx.Unlock()
+		return
+	}
 	bpr.peerID = peer.id
 	bpr.mtx.Unlock()
 
@@ -803,6 +897,10 @@ func (bpr *bpRequester) pickSecondPeerAndSendRequest() (picked bool) {
 	secondPeer := bpr.pool.pickIncrAvailablePeer(bpr.height, peerID)
 	if secondPeer != nil {
 		bpr.mtx.Lock()
+		if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+			bpr.mtx.Unlock()
+			return false
+		}
 		bpr.secondPeerID = secondPeer.id
 		bpr.mtx.Unlock()
 
@@ -841,7 +939,7 @@ OUTER_LOOP:
 		for {
 			select {
 			case <-bpr.pool.Quit():
-				if err := bpr.Stop(); err != nil {
+				if err := bpr.Stop(); err != nil && !errors.Is(err, service.ErrAlreadyStopped) {
 					bpr.Logger.Error("Error stopped requester", "err", err)
 				}
 				return
@@ -849,9 +947,12 @@ OUTER_LOOP:
 				return
 			case <-retryTimer.C:
 				if !gotBlock {
-					bpr.Logger.Debug("Retrying block request(s) after timeout", "height", bpr.height, "peer", bpr.peerID, "secondPeerID", bpr.secondPeerID)
-					bpr.reset(bpr.peerID)
-					bpr.reset(bpr.secondPeerID)
+					bpr.mtx.Lock()
+					peerID, secondPeerID := bpr.peerID, bpr.secondPeerID
+					bpr.mtx.Unlock()
+					bpr.Logger.Debug("Retrying block request(s) after timeout", "height", bpr.height, "peer", peerID, "secondPeerID", secondPeerID)
+					bpr.reset(peerID)
+					bpr.reset(secondPeerID)
 					continue OUTER_LOOP
 				}
 			case peerID := <-bpr.redoCh:

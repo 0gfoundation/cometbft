@@ -69,7 +69,8 @@ func (p testPeer) simulateInput(input inputData) {
 		}
 	}
 	err := input.pool.AddBlock(input.request.PeerID, block, extCommit, 123)
-	if !p.malicious {
+	if !p.malicious && input.pool.IsRunning() {
+		// An in-flight response can arrive after shutdown has rejected ingestion.
 		require.NoError(input.t, err)
 	}
 	// TODO: uncommenting this creates a race which is detected by:
