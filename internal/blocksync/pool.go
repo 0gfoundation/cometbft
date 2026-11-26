@@ -533,6 +533,22 @@ func (pool *BlockPool) pickIncrAvailablePeer(height int64, excludePeerID p2p.ID)
 	return nil
 }
 
+// Release a selection that was abandoned before sending. This is not a
+// response: do not update the receive monitor or extend other requests' timeout.
+func (pool *BlockPool) releasePeerReservation(peer *bpPeer) {
+	pool.mtx.Lock()
+	defer pool.mtx.Unlock()
+	// OnStop already clears all reservations; removed/replaced peers no longer
+	// own any capacity in this pool.
+	if !pool.IsRunning() || pool.peers[peer.id] != peer {
+		return
+	}
+	peer.numPending--
+	if peer.numPending == 0 {
+		peer.timeout.Stop()
+	}
+}
+
 // Sort peers by curRate, highest first.
 //
 // CONTRACT: pool.mtx must be locked.
@@ -928,6 +944,7 @@ PICK_PEER_LOOP:
 	bpr.mtx.Lock()
 	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
 		bpr.mtx.Unlock()
+		bpr.pool.releasePeerReservation(peer)
 		return
 	}
 	bpr.peerID = peer.id
@@ -952,6 +969,7 @@ func (bpr *bpRequester) pickSecondPeerAndSendRequest() (picked bool) {
 		bpr.mtx.Lock()
 		if !bpr.IsRunning() || !bpr.pool.IsRunning() {
 			bpr.mtx.Unlock()
+			bpr.pool.releasePeerReservation(secondPeer)
 			return false
 		}
 		bpr.secondPeerID = secondPeer.id
