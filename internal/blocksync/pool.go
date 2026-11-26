@@ -975,6 +975,9 @@ func (bpr *bpRequester) newHeight(height int64) {
 // Responsible for making more requests as necessary
 // Returns only when a block is found (e.g. AddBlock() is called).
 func (bpr *bpRequester) requestRoutine() {
+	retryTimer := newRequestRetryTimer()
+	defer retryTimer.Stop()
+
 OUTER_LOOP:
 	for {
 		if !bpr.beginRequestEpoch() {
@@ -987,8 +990,7 @@ OUTER_LOOP:
 			bpr.pickSecondPeerAndSendRequest()
 		}
 
-		retryTimer := time.NewTimer(requestRetrySeconds * time.Second)
-		defer retryTimer.Stop()
+		retryTimer.Reset(requestRetrySeconds * time.Second)
 
 		for {
 			select {
@@ -1000,6 +1002,7 @@ OUTER_LOOP:
 			case <-bpr.Quit():
 				return
 			case <-retryTimer.C:
+				retryTimer.Fired()
 				bpr.mtx.Lock()
 				if bpr.block == nil {
 					peerID, secondPeerID := bpr.peerID, bpr.secondPeerID
@@ -1024,7 +1027,6 @@ OUTER_LOOP:
 					// If the second peer was just set, reset the retryTimer to give the
 					// second peer a chance to respond.
 					if picked := bpr.pickSecondPeerAndSendRequest(); picked {
-						_ = retryTimer.Stop()
 						retryTimer.Reset(requestRetrySeconds * time.Second)
 					}
 				}
