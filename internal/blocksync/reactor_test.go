@@ -242,93 +242,62 @@ func TestNoBlockResponse(t *testing.T) {
 	}
 }
 
-// NOTE: This is too hard to test without
-// an easy way to add test peer to switch
-// or without significant refactoring of the module.
-// Alternatively we could actually dial a TCP conn but
-// that seems extreme.
 func TestBadBlockStopsPeer(t *testing.T) {
-	config = test.ResetTestRoot("blocksync_reactor_test")
-	defer os.RemoveAll(config.RootDir)
 	genDoc, privVals := randGenesisDoc()
-
-	maxBlockHeight := int64(148)
-
-	// Other chain needs a different validator set
 	otherGenDoc, otherPrivVals := randGenesisDoc()
-	otherChain := newReactor(t, log.TestingLogger(), otherGenDoc, otherPrivVals, maxBlockHeight)
+	const maxBlockHeight = int64(10)
+	pairs := []ReactorPair{
+		newReactor(t, log.TestingLogger(), otherGenDoc, otherPrivVals, maxBlockHeight),
+		newReactor(t, log.TestingLogger(), genDoc, privVals, 0),
+		newReactor(t, log.TestingLogger(), genDoc, privVals, maxBlockHeight),
+	}
+	pairs[0].reactor.blockSync = false
+	pairs[2].reactor.blockSync = false
+	target := pairs[1].reactor.Reactor
+	consensus := &lifecycleConsensus{calls: make(chan lifecycleConsensusCall, 1)}
+	consensus.BaseReactor = *p2p.NewBaseReactor("badBlockConsensus", consensus)
 
-	defer func() {
-		err := otherChain.reactor.Stop()
-		require.Error(t, err)
-		err = otherChain.app.Stop()
-		require.NoError(t, err)
-	}()
-
-	reactorPairs := make([]ReactorPair, 4)
-
-	reactorPairs[0] = newReactor(t, log.TestingLogger(), genDoc, privVals, maxBlockHeight)
-	reactorPairs[1] = newReactor(t, log.TestingLogger(), genDoc, privVals, 0)
-	reactorPairs[2] = newReactor(t, log.TestingLogger(), genDoc, privVals, 0)
-	reactorPairs[3] = newReactor(t, log.TestingLogger(), genDoc, privVals, 0)
-
-	switches := p2p.MakeConnectedSwitches(config.P2P, 4, func(i int, s *p2p.Switch) *p2p.Switch {
-		s.AddReactor("BLOCKSYNC", reactorPairs[i].reactor)
-		return s
-	}, p2p.Connect2Switches)
-
-	defer func() {
-		for _, r := range reactorPairs {
-			err := r.reactor.Stop()
-			require.NoError(t, err)
-
-			err = r.app.Stop()
-			require.NoError(t, err)
-		}
-	}()
-
-	for {
-		time.Sleep(1 * time.Second)
-		caughtUp := true
-		for _, r := range reactorPairs {
-			if isCaughtUp, _, _ := r.reactor.pool.IsCaughtUp(); !isCaughtUp {
-				caughtUp = false
+	// Start disconnected production reactors. The invalid chain must be the
+	// only source until its commit has actually been validated and rejected;
+	// racing healthy sources to the tip made the old peer-count oracle invalid.
+	var switches []*p2p.Switch
+	for i := range pairs {
+		i := i
+		switches = append(switches, p2p.MakeConnectedSwitches(cfg.DefaultP2PConfig(), 1, func(_ int, s *p2p.Switch) *p2p.Switch {
+			s.AddReactor("BLOCKSYNC", pairs[i].reactor.Reactor)
+			if i == 1 {
+				s.AddReactor("CONSENSUS", consensus)
 			}
-		}
-		if caughtUp {
-			break
-		}
+			return s
+		}, p2p.Connect2Switches)...)
 	}
-
-	// at this time, reactors[0-3] is the newest
-	assert.Equal(t, 3, reactorPairs[1].reactor.Switch.Peers().Size())
-
-	// Mark reactorPairs[3] as an invalid peer. Fiddling with .store without a mutex is a data
-	// race, but can't be easily avoided.
-	reactorPairs[3].reactor.store = otherChain.reactor.store
-
-	lastReactorPair := newReactor(t, log.TestingLogger(), genDoc, privVals, 0)
-	reactorPairs = append(reactorPairs, lastReactorPair) //nolint:makezero // when initializing with 0, the test breaks.
-
-	switches = append(switches, p2p.MakeConnectedSwitches(config.P2P, 1, func(_ int, s *p2p.Switch) *p2p.Switch {
-		s.AddReactor("BLOCKSYNC", reactorPairs[len(reactorPairs)-1].reactor)
-		return s
-	}, p2p.Connect2Switches)...)
-
-	for i := 0; i < len(reactorPairs)-1; i++ {
-		p2p.Connect2Switches(switches, i, len(reactorPairs)-1)
-	}
-
-	for {
-		isCaughtUp, _, _ := lastReactorPair.reactor.pool.IsCaughtUp()
-		if isCaughtUp || lastReactorPair.reactor.Switch.Peers().Size() == 0 {
-			break
+	t.Cleanup(func() {
+		for _, s := range switches {
+			assert.NoError(t, s.Stop())
 		}
+		for _, pair := range pairs {
+			assert.NoError(t, pair.app.Stop())
+		}
+	})
+	p2p.Connect2Switches(switches, 0, 1)
+	badID := switches[0].NodeInfo().ID()
+	require.Eventually(t, func() bool {
+		// Timeout/removal alone does not ban a peer: this proves invalid-block
+		// validation reached RemovePeerAndRedoAllPeerRequests.
+		return target.pool.IsPeerBanned(badID) && target.Switch.Peers().Get(badID) == nil
+	}, 10*time.Second, 10*time.Millisecond, "invalid commit was not validated and its sender evicted")
+	require.Zero(t, target.store.Height(), "wrong-validator chain must never be committed")
 
-		time.Sleep(1 * time.Second)
+	p2p.Connect2Switches(switches, 2, 1)
+	select {
+	case call := <-consensus.calls:
+		require.GreaterOrEqual(t, call.state.LastBlockHeight, maxBlockHeight-2)
+		require.LessOrEqual(t, call.state.LastBlockHeight, maxBlockHeight-1)
+		require.Equal(t, call.state.LastBlockHeight, target.store.Height())
+		require.NotNil(t, target.store.LoadBlockExtendedCommit(call.state.LastBlockHeight))
+	case <-time.After(10 * time.Second):
+		t.Fatal("sync did not recover with the honest source")
 	}
-
-	assert.Less(t, lastReactorPair.reactor.Switch.Peers().Size(), len(reactorPairs)-1)
 }
 
 func TestCheckSwitchToConsensusLastHeightZero(t *testing.T) {
