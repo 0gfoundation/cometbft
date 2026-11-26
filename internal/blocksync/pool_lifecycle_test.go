@@ -143,6 +143,57 @@ func TestBlockPoolLifecycleBlockedRequestStops(t *testing.T) {
 	waitLifecycleDone(t, done)
 }
 
+// Live backpressure must deliver the original peer error once capacity returns,
+// not silently discard it. A mismatched extended commit must never be retained.
+func TestBlockPoolLifecycleLiveErrorDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		height int64
+		commit *types.ExtendedCommit
+		want   string
+	}{
+		{"unexpected-block", 9, nil, "we didn't expect"},
+		{"wrong-peer", 1, nil, "not bad"},
+		{"extended-commit-height", 1, &types.ExtendedCommit{Height: 2}, "block height 1 != extCommit height 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := make(chan peerError, 1)
+			errs <- peerError{peerID: "sentinel"}
+			pool := lifecyclePool(t, nil, errs)
+			pool.makeNextRequester(1)
+			result := make(chan error, 1)
+			go func() {
+				result <- pool.AddBlock("bad", &types.Block{Header: types.Header{Height: tc.height}}, tc.commit, 1)
+			}()
+			waitLifecycleSender(t, "(*BlockPool).sendError")
+			// Verify capacity backpressure leaves the pool usable while still live.
+			available := make(chan struct{})
+			go func() { pool.Height(); close(available) }()
+			waitLifecycleDone(t, available)
+			require.Equal(t, p2p.ID("sentinel"), (<-errs).peerID)
+			select {
+			case delivered := <-errs:
+				require.Equal(t, p2p.ID("bad"), delivered.peerID)
+				require.ErrorContains(t, delivered.err, tc.want)
+				select {
+				case returned := <-result:
+					require.Equal(t, returned, delivered.err)
+				case <-time.After(time.Second):
+					t.Fatal("AddBlock did not return after delivery")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("live peer error was lost after queue drain")
+			}
+			require.True(t, pool.IsRunning())
+			pool.mtx.Lock()
+			requester := pool.requesters[1]
+			pool.mtx.Unlock()
+			require.Nil(t, requester.getBlock())
+			require.Nil(t, requester.getExtendedCommit())
+		})
+	}
+}
+
 func TestBlockPoolLifecycleSaturatedErrors(t *testing.T) {
 	for _, kind := range []string{"unexpected-block", "wrong-peer", "peer-timeout", "slow-peer"} {
 		t.Run(kind, func(t *testing.T) {
