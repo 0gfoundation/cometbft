@@ -316,9 +316,7 @@ func (pool *BlockPool) RedoRequestFrom(height int64, peerID p2p.ID) {
 	}
 
 	if requester, ok := pool.requesters[height]; ok { // If we requested this block
-		if requester.didRequestFrom(peerID) { // From this specific peer
-			requester.redo(peerID)
-		}
+		requester.redo(peerID) // Assignment check and enqueue share requester.mtx.
 	}
 }
 
@@ -445,9 +443,7 @@ func (pool *BlockPool) RemovePeer(peerID p2p.ID) {
 // CONTRACT: pool.mtx must be locked.
 func (pool *BlockPool) removePeer(peerID p2p.ID) {
 	for _, requester := range pool.requesters {
-		if requester.didRequestFrom(peerID) {
-			requester.redo(peerID)
-		}
+		requester.redo(peerID)
 	}
 
 	peer, ok := pool.peers[peerID]
@@ -700,7 +696,7 @@ type bpRequester struct {
 	pool        *BlockPool
 	height      int64
 	gotBlockCh  chan struct{}
-	redoCh      chan p2p.ID // redo may got multiple messages, add peerId to identify repeat
+	redoCh      chan struct{} // wake only; pending state is bounded by the two assignments
 	newHeightCh chan int64
 
 	mtx          cmtsync.Mutex
@@ -709,6 +705,14 @@ type bpRequester struct {
 	gotBlockFrom p2p.ID
 	block        *types.Block
 	extCommit    *types.ExtendedCommit
+	requestEpoch uint64
+	pendingRedo  [2]redoRequest
+}
+
+// redoRequest identifies a local assignment, not a wire-level request ID.
+type redoRequest struct {
+	peerID p2p.ID
+	epoch  uint64
 }
 
 func newBPRequester(pool *BlockPool, height int64) *bpRequester {
@@ -716,7 +720,7 @@ func newBPRequester(pool *BlockPool, height int64) *bpRequester {
 		pool:        pool,
 		height:      height,
 		gotBlockCh:  make(chan struct{}, 1),
-		redoCh:      make(chan p2p.ID, 1),
+		redoCh:      make(chan struct{}, 1),
 		newHeightCh: make(chan int64, 1),
 
 		peerID:       "",
@@ -742,6 +746,7 @@ func (bpr *bpRequester) OnStop() {
 	bpr.gotBlockFrom = ""
 	bpr.peerID = ""
 	bpr.secondPeerID = ""
+	bpr.pendingRedo = [2]redoRequest{}
 	select {
 	case <-bpr.redoCh:
 	default:
@@ -817,10 +822,11 @@ func (bpr *bpRequester) gotBlockFromPeerID() p2p.ID {
 }
 
 // Removes the block (IF we got it from the given peer) and resets the peer.
-func (bpr *bpRequester) reset(peerID p2p.ID) (removedBlock bool) {
-	bpr.mtx.Lock()
-	defer bpr.mtx.Unlock()
-
+// CONTRACT: bpr.mtx must be locked.
+func (bpr *bpRequester) resetLocked(peerID p2p.ID) (removedBlock bool) {
+	if peerID == "" || (bpr.peerID != peerID && bpr.secondPeerID != peerID) {
+		return false
+	}
 	// Only remove the block if we got it from that peer.
 	if bpr.gotBlockFrom == peerID {
 		bpr.block = nil
@@ -838,17 +844,64 @@ func (bpr *bpRequester) reset(peerID p2p.ID) (removedBlock bool) {
 	return removedBlock
 }
 
-// Tells bpRequester to pick another peer and try again.
-// NOTE: Nonblocking, and does nothing if another redo
-// was already requested.
+// Invalidate queued local events before assigning requests for the next round.
+// An old wake can remain in redoCh: the consumer always checks pending state.
+func (bpr *bpRequester) beginRequestEpoch() bool {
+	bpr.mtx.Lock()
+	defer bpr.mtx.Unlock()
+	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+		return false
+	}
+	bpr.requestEpoch++
+	bpr.pendingRedo = [2]redoRequest{}
+	return true
+}
+
+// Detach and apply the batch atomically with assignment changes. Producers
+// either join this batch or publish another wake after it; no wake is lost.
+// Returns true only when accepted events have exhausted both assignments.
+func (bpr *bpRequester) consumeRedo() bool {
+	bpr.mtx.Lock()
+	defer bpr.mtx.Unlock()
+	pending := bpr.pendingRedo
+	bpr.pendingRedo = [2]redoRequest{}
+	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+		return false
+	}
+	accepted := false
+	for _, redo := range pending {
+		if redo.peerID != "" && redo.epoch == bpr.requestEpoch &&
+			(redo.peerID == bpr.peerID || redo.peerID == bpr.secondPeerID) {
+			bpr.resetLocked(redo.peerID)
+			accepted = true
+		}
+	}
+	return accepted && bpr.peerID == "" && bpr.secondPeerID == ""
+}
+
+// Nonblocking: duplicate events coalesce in the assigned peer's fixed slot.
+// Checking the assignment here avoids a check/enqueue race in pool callers.
 func (bpr *bpRequester) redo(peerID p2p.ID) {
 	bpr.mtx.Lock()
 	defer bpr.mtx.Unlock()
 	if !bpr.IsRunning() || !bpr.pool.IsRunning() {
 		return
 	}
+	if peerID == "" {
+		return
+	}
+	var slot int
+	switch peerID {
+	case bpr.peerID:
+		slot = 0
+	case bpr.secondPeerID:
+		slot = 1
+	default:
+		return
+	}
+	bpr.pendingRedo[slot] = redoRequest{peerID: peerID, epoch: bpr.requestEpoch}
 	select {
-	case bpr.redoCh <- peerID:
+	case bpr.redoCh <- struct{}{}:
 	default:
 	}
 }
@@ -922,10 +975,11 @@ func (bpr *bpRequester) newHeight(height int64) {
 // Responsible for making more requests as necessary
 // Returns only when a block is found (e.g. AddBlock() is called).
 func (bpr *bpRequester) requestRoutine() {
-	gotBlock := false
-
 OUTER_LOOP:
 	for {
+		if !bpr.beginRequestEpoch() {
+			return
+		}
 		bpr.pickPeerAndSendRequest()
 
 		poolHeight := bpr.pool.Height()
@@ -946,30 +1000,25 @@ OUTER_LOOP:
 			case <-bpr.Quit():
 				return
 			case <-retryTimer.C:
-				if !gotBlock {
-					bpr.mtx.Lock()
+				bpr.mtx.Lock()
+				if bpr.block == nil {
 					peerID, secondPeerID := bpr.peerID, bpr.secondPeerID
+					bpr.resetLocked(peerID)
+					bpr.resetLocked(secondPeerID)
 					bpr.mtx.Unlock()
 					bpr.Logger.Debug("Retrying block request(s) after timeout", "height", bpr.height, "peer", peerID, "secondPeerID", secondPeerID)
-					bpr.reset(peerID)
-					bpr.reset(secondPeerID)
 					continue OUTER_LOOP
 				}
-			case peerID := <-bpr.redoCh:
-				if bpr.didRequestFrom(peerID) {
-					removedBlock := bpr.reset(peerID)
-					if removedBlock {
-						gotBlock = false
-					}
-				}
+				bpr.mtx.Unlock()
+			case <-bpr.redoCh:
 				// If both peers returned NoBlockResponse or bad block, reschedule both
-				// requests. If not, wait for the other peer.
-				if len(bpr.requestedFrom()) == 0 {
+				// requests. An empty/stale wake must not cancel a live request.
+				if bpr.consumeRedo() {
 					retryTimer.Stop()
 					continue OUTER_LOOP
 				}
 			case newHeight := <-bpr.newHeightCh:
-				if !gotBlock && bpr.height-newHeight < minBlocksForSingleRequest {
+				if bpr.getBlock() == nil && bpr.height-newHeight < minBlocksForSingleRequest {
 					// The operation is a noop if the second peer is already set. The cost is checking a mutex.
 					//
 					// If the second peer was just set, reset the retryTimer to give the
@@ -980,9 +1029,8 @@ OUTER_LOOP:
 					}
 				}
 			case <-bpr.gotBlockCh:
-				gotBlock = true
-				// We got a block!
-				// Continue the for-loop and wait til Quit.
+				// Wake only: redo may already have removed this block. Read the
+				// protected block state on timeout/newHeight rather than cache it.
 			}
 		}
 	}
